@@ -15,6 +15,7 @@ import tempfile
 import time
 import urllib.request
 import uuid
+import getpass
 from enum import Enum
 
 __version__ = '1'
@@ -227,7 +228,19 @@ def prepare_esp(args, loopdev):
 def mkfs_ext4(label, mount, dev):
     subprocess.run(["mkfs.ext4", "-L", label, "-M", mount, dev], check=True)
 
-def luks_create(dev, luks_key):
+def luks_read_passphrase(part_name):
+    tries = 0
+    while True:#tries < 3:
+        passphrase = getpass.getpass("Please enter passphrase for {} partition:".format(part_name))
+        passphrase_confirmation = getpass.getpass("Passphrase confirmation:")
+        if passphrase == passphrase_confirmation:
+            return passphrase
+        else:
+            print("Passphrase doesn't match confirmation. Please try again.")
+            tries += 1
+    return False
+
+def luks_format(dev, luks_key):
     print("formtating luks...")
     if luks_key.startswith('file:'):
         subprocess.run(["cryptsetup", "luksFormat", dev, luks_key[5:]], input="YES\n".encode("utf-8"), check=True)
@@ -245,6 +258,26 @@ def luks_open(dev, luks_key):
         subprocess.run(["cryptsetup", "luksOpen", dev, luks_name], input=luks_key, check=True)
     return os.path.join("/dev/mapper", luks_name)
 
+@contextlib.contextmanager
+def luks_try_format(loopdev_part, part_name, luks_key):
+    if luks_key:
+        print_step("Setting up LUKS encryption on {} partition...".format(part_name))
+
+        if luks_key == 'ask':
+            luks_key = luks_read_passphrase(part_name)
+
+        luks_format(loopdev_part, luks_key)
+        dev = luks_open(loopdev_part, luks_key)
+    else:
+        dev = loopdev_part
+
+    try:
+        yield dev, luks_key
+    finally:
+        if luks_key:
+            print_step("Closing {} LUKS partition.".format(part_name))
+            luks_close(dev)
+
 def luks_close(dev):
     subprocess.run(["cryptsetup", "luksClose", dev], check=True)
 
@@ -254,22 +287,17 @@ def prepare_root(args, loopdev):
     if args.root_partno is None:
         return
 
-    print_step("Formatting root partition...");
-
     if args.output_format == OutputFormat.raw_btrfs:
+        print_step("Formatting root partition...");
         subprocess.run(["mkfs.btrfs", "-Lroot", partition(loopdev, args.root_partno)], check=True)
     else:
-        if args.root_luks:
-            print_step("Setting up LUKS root partition...")
-            luks_create(partition(loopdev, args.root_partno), args.root_luks)
-            dev = luks_open(partition(loopdev, args.root_partno), args.root_luks)
+        loopdev_part = partition(loopdev, args.root_partno)
+        with luks_try_format(loopdev_part, "root", args.root_luks) as (dev, args.root_luks):
+            print_step("Formatting root partition...");
             mkfs_ext4("root", "/", dev)
-            luks_close(dev)
-        else:
-            mkfs_ext4("root", "/", partition(loopdev, args.root_partno))
+            print_step("Formatting root partition completed.");
 
 
-    print_step("Formatting root partition completed.");
 
 def prepare_home(args, loopdev):
     if loopdev is None:
@@ -277,18 +305,11 @@ def prepare_home(args, loopdev):
     if args.home_partno is None:
         return
 
-    print_step("Formatting home partition...");
-
-    if args.home_luks:
-        print_step("Setting up LUKS home partition...")
-        luks_create(partition(loopdev, args.home_partno), args.home_luks)
-        dev = luks_open(partition(loopdev, args.home_partno), args.home_luks)
+    loopdev_part = partition(loopdev, args.home_partno)
+    with luks_try_format(loopdev_part, "home", args.home_luks) as (dev, args.home_luks):
+        print_step("Formatting home partition...");
         mkfs_ext4("home", "/home", dev)
-        luks_close(dev)
-    else:
-        mkfs_ext4("home", "/home", partition(loopdev, args.home_partno))
-
-    print_step("Formatting home partition completed.");
+        print_step("Formatting home partition completed.");
 
 def prepare_srv(args, loopdev):
     if loopdev is None:
@@ -331,7 +352,6 @@ def mount_image(args, workspace, loopdev):
         root_dev = luks_open(root_dev, args.root_luks)
     mount_loop(args, root_dev, root)
 
-
     if args.home_partno is not None:
         home_dev = partition(loopdev, args.home_partno)
         if args.home_luks:
@@ -369,7 +389,7 @@ def mount_image(args, workspace, loopdev):
         if args.root_luks:
             print_step("Closing LUKS root");
             luks_close(root_dev)
-        if args.home_luks:
+        if args.home_luks and args.home_partno is not None:
             print_step("Closing LUKS home");
             luks_close(home_dev)
 
@@ -1159,9 +1179,9 @@ def parse_args():
     group.add_argument("--srv-size", help='Set size of /srv partition (only raw_gpt)', metavar='BYTES')
 
     group = parser.add_argument_group("LUKS")
-    group.add_argument("--root-luks", help='Encrypt root partition (only raw_gpt)', metavar='PASSPHRASE | file:KEYFILE')
-    group.add_argument("--home-luks", help='Encrypt /home partition (only raw_gpt)', metavar='PASSPHRASE | file:KEYFILE')
-    group.add_argument("--srv-luks", help='Encrypt /srv partition (only raw_gpt)', metavar='PASSPHRASE | file:KEYFILE')
+    group.add_argument("--root-luks", help='Encrypt root partition (only raw_gpt)', metavar='ask | PASSPHRASE | file:KEYFILE')
+    group.add_argument("--home-luks", help='Encrypt /home partition (only raw_gpt)', metavar='ask | PASSPHRASE | file:KEYFILE')
+    group.add_argument("--srv-luks", help='Encrypt /srv partition (only raw_gpt)', metavar='ask | PASSPHRASE | file:KEYFILE')
 
     group = parser.add_argument_group("Validation (only raw_gpt, raw_btrfs, tar)")
     group.add_argument("--checksum", action='store_true', help='Write SHA256SUM file')
@@ -1346,6 +1366,20 @@ def process_setting(args, section, key, value):
         elif key == "NSpawnSettings":
             if args.nspawn_settings is not None:
                 args.nspawn_settings = value
+        elif key is None:
+            return True
+        else:
+            return False
+    elif section == "LUKS":
+        if key == "RootLUKS":
+            if args.root_luks is None:
+                args.root_luks= value
+        elif key == "HomeLUKS":
+            if args.home_luks is None:
+                args.home_luks = value
+        elif key == "SrvLUKS":
+            if args.srv_luks is None:
+                args.srv_luks = value
         elif key is None:
             return True
         else:
