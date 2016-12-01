@@ -317,11 +317,11 @@ def prepare_srv(args, loopdev):
     if args.srv_partno is None:
         return
 
-    print_step("Formatting server data partition...");
-
-    mkfs_ext4("srv", "/srv", loopdev, args.srv_partno)
-
-    print_step("Formatted server data partition.");
+    loopdev_part = partition(loopdev, args.srv_partno)
+    with luks_try_format(loopdev_part, "srv", args.srv_luks) as (dev, args.srv_luks):
+        print_step("Formatting server data partition...");
+        mkfs_ext4("srv", "/srv", dev)
+        print_step("Formatted server data partition.");
 
 def mount_loop(args, dev, where):
     os.makedirs(where, 0o755, True)
@@ -359,7 +359,10 @@ def mount_image(args, workspace, loopdev):
         mount_loop(args, home_dev, os.path.join(root, "home"))
 
     if args.srv_partno is not None:
-        mount_loop(args, partition(loopdev, args.srv_partno), os.path.join(root, "srv"))
+        srv_dev = partition(loopdev, args.srv_partno)
+        if args.srv_luks:
+            srv_dev = luks_open(srv_dev, args.srv_luks)
+        mount_loop(args, srv_dev, os.path.join(root, "srv"))
 
     if args.esp_partno is not None:
         mount_loop(args, partition(loopdev, args.esp_partno), os.path.join(root, "boot/efi"))
@@ -392,6 +395,9 @@ def mount_image(args, workspace, loopdev):
         if args.home_luks and args.home_partno is not None:
             print_step("Closing LUKS home");
             luks_close(home_dev)
+        if args.srv_luks and args.srv_partno is not None:
+            print_step("Closing LUKS srv");
+            luks_close(srv_dev)
 
 def mount_cache(args, workspace):
     if not args.distribution in (Distribution.fedora, Distribution.debian, Distribution.ubuntu):
