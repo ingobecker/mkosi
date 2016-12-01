@@ -286,7 +286,7 @@ def prepare_home(args, loopdev):
         mkfs_ext4("home", "/home", dev)
         luks_close(dev)
     else:
-        mkfs_ext4("home", "/home", loopdev, args.home_partno)
+        mkfs_ext4("home", "/home", partition(loopdev, args.home_partno))
 
     print_step("Formatting home partition completed.");
 
