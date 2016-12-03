@@ -232,18 +232,19 @@ def mkfs_ext4(label, mount, dev):
 
 def prepare_luks(args):
 
-    print_step("LUKS setup")
-    passphrase = luks_read_passphrase()
-    print_step("LUKS passphrase: {}".format(passphrase))
-
     keys = {}
+    print_step("LUKS setup")
+
     if args.luks_encryption == "all":
-        keys["root"] = passphrase
-        keys["home"] = passphrase
-        keys["srv"] = passphrase
-    elif args.luks_encryption == "data":
-        keys["home"] = passphrase
-        keys["srv"] = passphrase
+        print_step("Setting up LUKS {} passphrase".format('root'))
+        keys["root"] = luks_read_passphrase()
+
+    if args.home_partno is not None:
+        print_step("Setting up LUKS {} passphrase".format('home'))
+        keys["home"] = luks_read_passphrase()
+    if args.srv_partno is not None:
+        print_step("Setting up LUKS {} passphrase".format('srv'))
+        keys["srv"] = luks_read_passphrase()
 
     return keys
 
