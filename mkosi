@@ -5,17 +5,19 @@ import configparser
 import contextlib
 import ctypes, ctypes.util
 import crypt
+import getpass
 import hashlib
 import os
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.request
 import uuid
-import getpass
+
 from enum import Enum
 
 __version__ = '1'
@@ -228,51 +230,65 @@ def prepare_esp(args, loopdev):
 def mkfs_ext4(label, mount, dev):
     subprocess.run(["mkfs.ext4", "-L", label, "-M", mount, dev], check=True)
 
-def luks_read_passphrase(part_name):
-    tries = 0
-    while True:#tries < 3:
-        passphrase = getpass.getpass("Please enter passphrase for {} partition:".format(part_name))
-        passphrase_confirmation = getpass.getpass("Passphrase confirmation:")
-        if passphrase == passphrase_confirmation:
-            return passphrase
-        else:
-            print("Passphrase doesn't match confirmation. Please try again.")
-            tries += 1
-    return False
+def prepare_luks(args):
+
+    print_step("LUKS setup")
+    passphrase = luks_read_passphrase()
+    print_step("LUKS passphrase: {}".format(passphrase))
+
+    keys = {}
+    if args.luks_encryption == "all":
+        keys["root"] = passphrase
+        keys["home"] = passphrase
+        keys["srv"] = passphrase
+    elif args.luks_encryption == "data":
+        keys["home"] = passphrase
+        keys["srv"] = passphrase
+
+    return keys
+
+def luks_read_passphrase():
+    try:
+        passphrase_mode = os.stat('mkosi.passphrase').st_mode & (stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+        if (passphrase_mode & stat.S_IRWXU > 0o600) or (passphrase_mode & (stat.S_IRWXG | stat.S_IRWXO) > 0):
+            print_step("WARNING: mkosi.passphrase permissions '{}' are too open. It's recommended that it's only accessible by its owner.".format(oct(passphrase_mode)))
+
+        with open('mkosi.passphrase', 'r') as f:
+            return f.read().strip('\n')
+
+    except FileNotFoundError:
+        while True:
+            passphrase = getpass.getpass("Please enter passphrase:")
+            passphrase_confirmation = getpass.getpass("Passphrase confirmation:")
+            if passphrase == passphrase_confirmation:
+                return passphrase
+            else:
+                print("Passphrase doesn't match confirmation. Please try again.")
 
 def luks_format(dev, luks_key):
     print("formtating luks...")
-    if luks_key.startswith('file:'):
-        subprocess.run(["cryptsetup", "luksFormat", dev, luks_key[5:]], input="YES\n".encode("utf-8"), check=True)
-    else:
-        luks_key = ((luks_key + "\n")*2).encode("utf-8")
-        subprocess.run(["cryptsetup", "luksFormat", dev], input=luks_key, check=True)
+    luks_key = ((luks_key + "\n")*2).encode("utf-8")
+    subprocess.run(["cryptsetup", "luksFormat", dev], input=luks_key, check=True)
 
 def luks_open(dev, luks_key):
     print("opening luks...")
     luks_name = str(uuid.uuid4())
-    if luks_key.startswith('file:'):
-        subprocess.run(["cryptsetup", "luksOpen", dev, luks_name, "--key-file", luks_key[5:]], check=True)
-    else:
-        luks_key = (luks_key+"\n").encode("utf-8")
-        subprocess.run(["cryptsetup", "luksOpen", dev, luks_name], input=luks_key, check=True)
+    luks_key = (luks_key+"\n").encode("utf-8")
+    subprocess.run(["cryptsetup", "luksOpen", dev, luks_name], input=luks_key, check=True)
     return os.path.join("/dev/mapper", luks_name)
 
 @contextlib.contextmanager
-def luks_try_format(loopdev_part, part_name, luks_key):
+def luks_try_format(loopdev_part, part_name, luks_keys):
+    luks_key = luks_keys.get(part_name, None)
     if luks_key:
         print_step("Setting up LUKS encryption on {} partition...".format(part_name))
-
-        if luks_key == 'ask':
-            luks_key = luks_read_passphrase(part_name)
-
         luks_format(loopdev_part, luks_key)
         dev = luks_open(loopdev_part, luks_key)
     else:
         dev = loopdev_part
 
     try:
-        yield dev, luks_key
+        yield dev
     finally:
         if luks_key:
             print_step("Closing {} LUKS partition.".format(part_name))
@@ -281,7 +297,7 @@ def luks_try_format(loopdev_part, part_name, luks_key):
 def luks_close(dev):
     subprocess.run(["cryptsetup", "luksClose", dev], check=True)
 
-def prepare_root(args, loopdev):
+def prepare_root(args, loopdev, luks_keys):
     if loopdev is None:
         return
     if args.root_partno is None:
@@ -292,33 +308,31 @@ def prepare_root(args, loopdev):
         subprocess.run(["mkfs.btrfs", "-Lroot", partition(loopdev, args.root_partno)], check=True)
     else:
         loopdev_part = partition(loopdev, args.root_partno)
-        with luks_try_format(loopdev_part, "root", args.root_luks) as (dev, args.root_luks):
+        with luks_try_format(loopdev_part, "root", luks_keys) as dev:
             print_step("Formatting root partition...");
             mkfs_ext4("root", "/", dev)
             print_step("Formatting root partition completed.");
 
-
-
-def prepare_home(args, loopdev):
+def prepare_home(args, loopdev, luks_keys):
     if loopdev is None:
         return
     if args.home_partno is None:
         return
 
     loopdev_part = partition(loopdev, args.home_partno)
-    with luks_try_format(loopdev_part, "home", args.home_luks) as (dev, args.home_luks):
+    with luks_try_format(loopdev_part, "home", luks_keys) as dev:
         print_step("Formatting home partition...");
         mkfs_ext4("home", "/home", dev)
         print_step("Formatting home partition completed.");
 
-def prepare_srv(args, loopdev):
+def prepare_srv(args, loopdev, luks_keys):
     if loopdev is None:
         return
     if args.srv_partno is None:
         return
 
     loopdev_part = partition(loopdev, args.srv_partno)
-    with luks_try_format(loopdev_part, "srv", args.srv_luks) as (dev, args.srv_luks):
+    with luks_try_format(loopdev_part, "srv", luks_keys) as dev:
         print_step("Formatting server data partition...");
         mkfs_ext4("srv", "/srv", dev)
         print_step("Formatted server data partition.");
@@ -338,7 +352,7 @@ def mount_bind(what, where):
     subprocess.run(["mount", "--bind", what, where], check=True)
 
 @contextlib.contextmanager
-def mount_image(args, workspace, loopdev):
+def mount_image(args, workspace, loopdev, luks_keys):
     if loopdev is None:
         yield None
         return
@@ -348,20 +362,20 @@ def mount_image(args, workspace, loopdev):
     root = os.path.join(workspace, "root")
     root_dev = partition(loopdev, args.root_partno)
 
-    if args.root_luks:
-        root_dev = luks_open(root_dev, args.root_luks)
+    if "root" in luks_keys:
+        root_dev = luks_open(root_dev, luks_keys["root"])
     mount_loop(args, root_dev, root)
 
     if args.home_partno is not None:
         home_dev = partition(loopdev, args.home_partno)
-        if args.home_luks:
-            home_dev = luks_open(home_dev, args.home_luks)
+        if "home" in luks_keys:
+            home_dev = luks_open(home_dev, luks_keys["home"])
         mount_loop(args, home_dev, os.path.join(root, "home"))
 
     if args.srv_partno is not None:
         srv_dev = partition(loopdev, args.srv_partno)
-        if args.srv_luks:
-            srv_dev = luks_open(srv_dev, args.srv_luks)
+        if "srv" in luks_keys:
+            srv_dev = luks_open(srv_dev, luks_keys["srv"])
         mount_loop(args, srv_dev, os.path.join(root, "srv"))
 
     if args.esp_partno is not None:
@@ -389,15 +403,19 @@ def mount_image(args, workspace, loopdev):
         umount(os.path.join(root))
 
         print_step("Unmounting image completed.");
-        if args.root_luks:
-            print_step("Closing LUKS root");
-            luks_close(root_dev)
-        if args.home_luks and args.home_partno is not None:
-            print_step("Closing LUKS home");
-            luks_close(home_dev)
-        if args.srv_luks and args.srv_partno is not None:
-            print_step("Closing LUKS srv");
-            luks_close(srv_dev)
+        if args.luks_encryption is not None:
+
+            if args.home_partno is not None:
+                print_step("Closing LUKS home");
+                luks_close(home_dev)
+
+            if args.srv_partno is not None:
+                print_step("Closing LUKS srv");
+                luks_close(srv_dev)
+
+            if args.luks_encryption == 'all':
+                print_step("Closing LUKS root");
+                luks_close(root_dev)
 
 def mount_cache(args, workspace):
     if not args.distribution in (Distribution.fedora, Distribution.debian, Distribution.ubuntu):
@@ -726,7 +744,7 @@ SigLevel    = Required DatabaseOptional
     packages = set(c.stdout.split())
     packages.remove("base")
 
-    if args.root_luks is None and args.home_luks is None:
+    if args.luks_encryption is None:
         packages.remove("cryptsetup")
 
     packages -= {"device-mapper",
@@ -793,7 +811,7 @@ def set_root_password(args, workspace):
         patch_file(os.path.join(workspace, 'root', 'etc/shadow'), jj)
 
 def install_boot_loader_arch(args, workspace, loopdev):
-    if args.root_luks:
+    if args.luks_encryption == 'all':
         c = subprocess.run(["lsblk", "-n", "--output", "UUID", partition(loopdev, args.root_partno)],
                        stdout=subprocess.PIPE, check=True)
         root_uuid = c.stdout.decode("utf-8").split()[0]
@@ -1185,9 +1203,7 @@ def parse_args():
     group.add_argument("--srv-size", help='Set size of /srv partition (only raw_gpt)', metavar='BYTES')
 
     group = parser.add_argument_group("LUKS")
-    group.add_argument("--root-luks", help='Encrypt root partition (only raw_gpt)', metavar='ask | PASSPHRASE | file:KEYFILE')
-    group.add_argument("--home-luks", help='Encrypt /home partition (only raw_gpt)', metavar='ask | PASSPHRASE | file:KEYFILE')
-    group.add_argument("--srv-luks", help='Encrypt /srv partition (only raw_gpt)', metavar='ask | PASSPHRASE | file:KEYFILE')
+    group.add_argument("--luks-encryption", choices=("all", "data"), help='Encrypt evrything except: esp (all) or esp and root (data)')
 
     group = parser.add_argument_group("Validation (only raw_gpt, raw_btrfs, tar)")
     group.add_argument("--checksum", action='store_true', help='Write SHA256SUM file')
@@ -1377,15 +1393,9 @@ def process_setting(args, section, key, value):
         else:
             return False
     elif section == "LUKS":
-        if key == "RootLUKS":
-            if args.root_luks is None:
-                args.root_luks= value
-        elif key == "HomeLUKS":
-            if args.home_luks is None:
-                args.home_luks = value
-        elif key == "SrvLUKS":
-            if args.srv_luks is None:
-                args.srv_luks = value
+        if key == "Encryption":
+            if args.luks_encryption is None:
+                args.luks_encryption = value
         elif key is None:
             return True
         else:
@@ -1734,16 +1744,20 @@ def build_image(args, workspace, run_build_script):
         return (None, None)
 
     tar = None
+    luks_keys = {}
+
+    if args.luks_encryption is not None:
+        luks_keys = prepare_luks(args)
 
     raw = create_image(args, workspace.name)
     with attach_image_loopback(args, raw) as loopdev:
         prepare_swap(args, loopdev)
         prepare_esp(args, loopdev)
-        prepare_root(args, loopdev)
-        prepare_home(args, loopdev)
-        prepare_srv(args, loopdev)
+        prepare_root(args, loopdev, luks_keys)
+        prepare_home(args, loopdev, luks_keys)
+        prepare_srv(args, loopdev, luks_keys)
 
-        with mount_image(args, workspace.name, loopdev):
+        with mount_image(args, workspace.name, loopdev, luks_keys):
             prepare_tree(args, workspace.name)
             mount_cache(args, workspace.name)
             install_distribution(args, workspace.name, run_build_script)
